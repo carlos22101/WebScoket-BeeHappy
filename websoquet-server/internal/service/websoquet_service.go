@@ -4,16 +4,14 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
-
+	"os"
 	"WS/websoquet-server/internal/domain"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
-const (
-	mqttBroker = "tcp://13.223.36.70:1883"
-	mqttTopic  = "colmena/data"
-)
+
+
 
 type WebsoquetService struct {
 	Clients map[string][]domain.Client
@@ -31,6 +29,12 @@ func NewWebsoquetService() *WebsoquetService {
 
 
 func (s *WebsoquetService) initMQTT() {
+	var mqttBroker = os.Getenv("MQTT_BROKER")
+var mqttTopic = os.Getenv("MQTT_TOPIC")
+
+	if mqttBroker == "" || mqttTopic == "" {
+	log.Fatal("MQTT_BROKER or MQTT_TOPIC not set — check your .env file")
+}
 	opts := mqtt.NewClientOptions().AddBroker(mqttBroker)
 	opts.SetClientID("ws-subscriber")
 	opts.SetAutoReconnect(true)
