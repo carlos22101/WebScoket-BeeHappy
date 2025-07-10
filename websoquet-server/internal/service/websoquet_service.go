@@ -1,80 +1,104 @@
 package service
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
+
 	"WS/websoquet-server/internal/domain"
 
-	"github.com/gorilla/websocket"
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+)
+
+const (
+	mqttBroker = "tcp://13.223.36.70:1883"
+	mqttTopic  = "colmena/data"
 )
 
 type WebsoquetService struct {
-	Clients map[string][]domain.Client // Ahora es una lista de clientes por mac address
+	Clients map[string][]domain.Client
 	mu      sync.Mutex
+	mqttCli mqtt.Client
 }
 
 func NewWebsoquetService() *WebsoquetService {
-	return &WebsoquetService{
+	s := &WebsoquetService{
 		Clients: make(map[string][]domain.Client),
 	}
+	s.initMQTT()
+	return s
 }
 
 
-// RegisterClient asocia un cliente a un accountID.
+func (s *WebsoquetService) initMQTT() {
+	opts := mqtt.NewClientOptions().AddBroker(mqttBroker)
+	opts.SetClientID("ws-subscriber")
+	opts.SetAutoReconnect(true)
+
+	s.mqttCli = mqtt.NewClient(opts)
+	if tok := s.mqttCli.Connect(); tok.Wait() && tok.Error() != nil {
+		log.Fatalf("Failed to connect to MQTT broker: %v", tok.Error())
+	}
+	log.Printf("Connected to MQTT broker %s", mqttBroker)
+
+	if tok := s.mqttCli.Subscribe(mqttTopic, 0, s.onMQTTMessage); tok.Wait() && tok.Error() != nil {
+		log.Fatalf("Failed to subscribe to %s: %v", mqttTopic, tok.Error())
+	}
+	log.Printf("Subscribed to MQTT topic %s", mqttTopic)
+}
+
+// onMQTTMessage se llama al recibir un mensaje MQTT.
+func (s *WebsoquetService) onMQTTMessage(_ mqtt.Client, msg mqtt.Message) {
+	var m domain.Message
+	if err := json.Unmarshal(msg.Payload(), &m); err != nil {
+		log.Printf("Invalid MQTT payload: %v", err)
+		return
+	}
+	s.SendMessageToAccount(m.Receiver, msg.Payload())
+}
+
 func (s *WebsoquetService) RegisterClient(accountID string, client domain.Client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
-	// Agrega el nuevo cliente a la lista existente de la misma mac address
 	s.Clients[accountID] = append(s.Clients[accountID], client)
-	log.Printf("Cliente registrado: %s\n", accountID)
+	log.Printf("Client registered: %s", accountID)
 }
 
-
-// SendMessageToAccount envía un mensaje únicamente al cliente asociado a 'receiver'.
+// SendMessageToAccount envía el mensaje a todos los clientes de ese receiver.
 func (s *WebsoquetService) SendMessageToAccount(receiver string, msg []byte) {
 	s.mu.Lock()
-	clients, ok := s.Clients[receiver]
+	clients := s.Clients[receiver]
 	s.mu.Unlock()
-	if !ok {
-		log.Printf("Cliente %s no encontrado\n", receiver)
+
+	if len(clients) == 0 {
+		log.Printf("No clients for receiver %s", receiver)
 		return
 	}
-
-	// Enviar mensaje a todos los clientes conectados con la misma mac address
-	for _, client := range clients {
-		err := client.WriteMessage(websocket.TextMessage, msg)
-		if err != nil {
-			log.Printf("Error enviando mensaje a %s: %v\n", receiver, err)
-			s.RemoveClient(receiver, client) // Remover solo el cliente con error
+	for _, c := range clients {
+		if err := c.WriteMessage(1 /* TextMessage */, msg); err != nil {
+			log.Printf("Error sending to %s: %v", receiver, err)
+			s.RemoveClient(receiver, c)
 		}
 	}
 }
 
-
-// RemoveClient elimina la conexión de un cliente dado su accountID.
-func (s *WebsoquetService) RemoveClient(accountID string, clientToRemove domain.Client) {
+// RemoveClient elimina un cliente desconectado.
+func (s *WebsoquetService) RemoveClient(accountID string, toRemove domain.Client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	clients := s.Clients[accountID]
-	newClients := []domain.Client{}
-
-	// Filtramos la lista eliminando solo el cliente que se desconectó
-	for _, client := range clients {
-		if client != clientToRemove {
-			newClients = append(newClients, client)
+	list := s.Clients[accountID]
+	newList := make([]domain.Client, 0, len(list))
+	for _, c := range list {
+		if c != toRemove {
+			newList = append(newList, c)
 		} else {
-			client.Close()
-			log.Printf("Cliente desconectado de %s\n", accountID)
+			c.Close()
+			log.Printf("Client disconnected: %s", accountID)
 		}
 	}
-
-	// Si ya no hay clientes conectados con esa mac address, eliminamos la clave
-	if len(newClients) == 0 {
+	if len(newList) == 0 {
 		delete(s.Clients, accountID)
 	} else {
-		s.Clients[accountID] = newClients
+		s.Clients[accountID] = newList
 	}
 }
-
